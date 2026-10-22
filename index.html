@@ -1,378 +1,241 @@
 <!doctype html>
-<!--
-Copyright 2026 Google LLC
-SPDX-License-Identifier: Apache-2.0
-Reduced from Neuroglancer's Apache-2.0-licensed skeleton/circle/OIT shaders.
--->
-<html lang="en">
+<!-- Copyright 2026 Google LLC. SPDX-License-Identifier: Apache-2.0 -->
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ANGLE D3D11: discard-containing function argument</title>
-<style>
-  body { max-width: 1000px; margin: 2em auto; padding: 0 1em; font: 16px system-ui; }
-  button { margin: .3em; padding: .5em; }
-  canvas { width: 128px; height: 128px; border: 1px solid #888; }
-  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #eee; padding: 1em; }
-  .case { display: inline-block; vertical-align: top; padding: .5em; }
-</style>
-<h1>ANGLE D3D11: discard-containing function argument</h1>
-<p>
-  Standalone reduction of a Neuroglancer transparent skeleton-node shader failure.
-  No libraries, network requests, authentication, or dataset are required.
-  Open this file directly in a Windows browser using ANGLE/D3D11.
-</p>
-<p>
-  <strong>Warning:</strong> the original application sometimes lost its WebGL
-  context or crashed the tab. Save other work first. Tests run only when clicked.
-  An unaffected backend is expected to pass every case. This reduced test must
-  still be confirmed on an affected Windows machine.
-</p>
-<p>
-  The compared fragment shaders differ only in the body of <code>emitDefault</code>:
-</p>
-<pre>Nested: emit(getCircleColor(uColor, uColor), uPickID);
-Local:  vec4 circleColor = getCircleColor(uColor, uColor);
-        emit(circleColor, uPickID);</pre>
-<p>
-  Both should draw an identical circle. Transparent cases use two RGBA32F render
-  targets and weighted blended OIT; opaque controls use three RGBA32F targets.
-  The test checks compile/link status, draw-time errors, framebuffer pixels,
-  circle clipping, and post-draw compiler logs.
-</p>
-<button id="run">Run all (working variants first)</button>
-<button id="download">Download JSON report</button>
-<div id="cases"></div>
-<p id="summary">Not run.</p>
-<pre id="results"></pre>
-<details>
-  <summary>Shader sources and reporting instructions</summary>
-  <p>
-    File with ANGLE at <a href="https://anglebug.com/new">anglebug.com/new</a>.
-    Attach this HTML and the downloaded JSON, browser version, Windows version,
-    and GPU/driver/backend details from chrome://gpu or Firefox about:support.
-    Expected failure signature in the original application:
-    GL_INVALID_OPERATION, Error compiling dynamic pixel executable,
-    internal error: invalid access of unbound variable.
-    Compile/link can succeed before a draw-time HLSL compilation failure.
-    Translated source may omit final draw-time specialization.
-    If this reduction does not fail, report that rather than claiming a reproduction.
-  </p>
-  <pre id="sources"></pre>
-</details>
+<title>ANGLE D3D11 discard argument reproduction</title>
+<h1>ANGLE D3D11 discard argument reproduction</h1>
+<p>Save your work first: the failing draw may cause context loss.
+Run one case, then restart Chrome before testing the other if WebGL becomes unavailable.
+Both cases should compile, link, and produce identical pixels.
+This further reduction needs confirmation on the affected Windows machine.
+The original confirmed version is in commit <code>4fed09d</code>.
+Test the baseline first, then compare each reduction against its stated parent.
+A reduction is useful only if nested still fails and local still passes.</p>
+<label>Shader variant: <select id="variant"></select></label>
+<p id="description"></p>
+<button id="local">Run local-variable control</button>
+<button id="nested">Run nested-call reproduction</button>
+<button id="download">Download current report</button>
+<details><summary>Selected fragment shaders</summary><pre id="sources"></pre></details>
+<pre id="output">Choose a case. Results and shader sources will appear here.</pre>
 <script>
 "use strict";
-const size = 16;
 const vertexSource = `#version 300 es
 precision highp float;
-precision highp int;
-out highp vec4 vCircleCoord;
-out highp float vCustom1;
-out highp float vCustom2;
+out vec4 circleCoord;
 void main() {
   const vec2 corners[6] = vec2[](
     vec2(-1.0, -1.0), vec2(-1.0, 1.0), vec2(1.0, 1.0),
     vec2(1.0, 1.0), vec2(1.0, -1.0), vec2(-1.0, -1.0));
   vec2 corner = corners[gl_VertexID % 6];
   gl_Position = vec4(corner * 0.5, 0.0, 1.0);
-  vCircleCoord = vec4(corner, 8.0, 1e-6);
-  vCustom1 = 1.0;
-  vCustom2 = 2.0;
-}
-`;
-function fragmentSource(transparent, local) {
+  circleCoord = vec4(corner, 8.0, 1e-6);
+}`;
+const variants = [
+  { id: "baseline", description: "Baseline: full circle helper and OIT emitter." },
+  { id: "simple-helper", simple: true,
+    description: "From baseline: replace circle math with one conditional discard and return." },
+  { id: "direct-outputs", simple: true, direct: true,
+    description: "From simple-helper: remove the emitAccum wrapper." },
+  { id: "constant-weight", simple: true, direct: true, constant: true,
+    description: "From direct-outputs: replace the OIT weight calculation with 1.0 (also removes gl_FragCoord)." },
+  { id: "single-output", simple: true, direct: true, constant: true, single: true,
+    description: "From constant-weight: remove the second fragment output and render target." },
+  { id: "no-discard", simple: true, noDiscard: true,
+    description: "Control from simple-helper: remove only discard; retain full OIT math and wrapper." },
+  { id: "no-frag-coord", simple: true, fixedDepth: true,
+    description: "Control from simple-helper: use depth 0.5 instead of gl_FragCoord.z; same expected pixels." },
+];
+function fragmentSource(local, variant) {
   return `#version 300 es
 precision highp float;
-precision highp int;
-uniform highp vec4 uColor;
-uniform highp uint uPickID;
-in highp vec4 vCircleCoord;
-in highp float vCustom1;
-in highp float vCustom2;
-${transparent ? `
-layout(location = 0) out vec4 v4f_fragData0;
-layout(location = 1) out vec4 v4f_fragData1;
-float computeOITWeight(float alpha, float depth) {
+uniform vec4 color;
+in vec4 circleCoord;
+layout(location = 0) out vec4 accumOutput;
+${variant.single ? "" : "layout(location = 1) out vec4 weightOutput;"}
+${variant.constant ? "" : `
+float weight(float alpha, float depth) {
   float a = min(1.0, alpha) * 8.0 + 0.01;
   float b = -depth * 0.95 + 1.0;
   return a * a * a * b * b * b;
+}`}
+${variant.direct ? "" : `
+void emitAccum(vec4 accum, float revealage) {
+  accumOutput = vec4(accum.rgb, revealage);
+  weightOutput = vec4(accum.a, 0.0, 0.0, 0.0);
+}`}
+void emit(vec4 value) {
+  float w = ${variant.constant ? "1.0" : `weight(value.a, ${variant.fixedDepth ? "0.5" : "gl_FragCoord.z"})`};
+  vec4 accum = value * w;
+  ${variant.direct ? `accumOutput = vec4(accum.rgb, value.a);
+  ${variant.single ? "" : "weightOutput = vec4(accum.a, 0.0, 0.0, 0.0);"}` : "emitAccum(accum, value.a);"}
 }
-void emitAccumAndRevealage(vec4 accum, float revealage, highp uint pickId) {
-  v4f_fragData0 = vec4(accum.rgb, revealage);
-  v4f_fragData1 = vec4(accum.a, 0.0, 0.0, 0.0);
-}
-void emit(vec4 color, highp uint pickId) {
-  float weight = computeOITWeight(color.a, gl_FragCoord.z);
-  vec4 accum = color * weight;
-  emitAccumAndRevealage(accum, color.a, pickId);
-}
-` : `
-layout(location = 0) out vec4 out_color;
-layout(location = 1) out highp vec4 out_z;
-layout(location = 2) out highp vec4 out_pickId;
-void emit(vec4 color, highp uint pickId) {
-  out_color = color;
-  float zValue = 1.0 - gl_FragCoord.z;
-  out_z = vec4(zValue, zValue, zValue, 1.0);
-  float pickIdFloat = float(pickId);
-  out_pickId = vec4(pickIdFloat, pickIdFloat, pickIdFloat, 1.0);
-}
-`}
-float getCircleAlphaMultiplier() { return 1.0; }
-vec4 getCircleColor(vec4 interiorColor, vec4 borderColor) {
-  float radius = length(vCircleCoord.xy);
+${variant.simple ? `
+vec4 circleColor(vec4 interior, vec4 border) {
+  ${variant.noDiscard ? "" : "if (circleCoord.x < -0.75) discard;"}
+  return interior;
+}` : `
+vec4 circleColor(vec4 interior, vec4 border) {
+  float radius = length(circleCoord.xy);
   if (radius > 1.0) discard;
-  float borderColorFraction = clamp((radius - vCircleCoord.z) / vCircleCoord.w, 0.0, 1.0);
-  float feather = clamp((1.0 - radius) / vCircleCoord.w, 0.0, 1.0);
-  vec4 color = mix(interiorColor, borderColor, borderColorFraction);
-  return vec4(color.rgb, color.a * feather * getCircleAlphaMultiplier());
+  float borderFraction = clamp((radius - circleCoord.z) / circleCoord.w, 0.0, 1.0);
+  float feather = clamp((1.0 - radius) / circleCoord.w, 0.0, 1.0);
+  vec4 result = mix(interior, border, borderFraction);
+  return vec4(result.rgb, result.a * feather);
+}`}
+void main() {
+  ${local ? "vec4 c = circleColor(color, color); emit(c);" : "emit(circleColor(color, color));"}
+}`;
 }
-vec4 segmentColor() { return uColor; }
-void emitRGBA(vec4 color) {
-  color.a *= uColor.a;
-  color.rgb *= color.a;
-  vec4 borderColor = color;
-  emit(getCircleColor(color, borderColor), uPickID);
-}
-void emitRGB(vec3 color) { emitRGBA(vec4(color, 1.0)); }
-void emitDefault() {
-  ${local ? `vec4 circleColor = getCircleColor(uColor, uColor);
-  emit(circleColor, uPickID);` : "emit(getCircleColor(uColor, uColor), uPickID);"}
-}
-#define radius vCustom1
-#define prop_radius() vCustom1
-#define compartment vCustom2
-#define prop_compartment() vCustom2
-void main() { emitDefault(); }
-`;
-}
-const variants = [
-  { id: "oit-local", transparent: true, local: true },
-  { id: "opaque-local", transparent: false, local: true },
-  { id: "opaque-nested", transparent: false, local: false },
-  { id: "oit-nested", transparent: true, local: false },
-];
-const report = {
-  title: document.title,
-  userAgent: navigator.userAgent,
-  timestamp: new Date().toISOString(),
-  vertexSource,
-  results: {},
-};
-const output = document.querySelector("#results");
-const summary = document.querySelector("#summary");
-function publish() {
-  output.textContent = JSON.stringify(report, null, 2);
-  const nested = report.results["oit-nested"];
-  const local = report.results["oit-local"];
-  summary.textContent = nested && local
-    ? local.status === "PASS" && nested.status === "FAIL"
-      ? "Differential failure reproduced: OIT local passes; OIT nested fails. Inspect compiler logs."
-      : local.status === "PASS" && nested.status === "PASS"
-        ? "Both OIT variants pass on this backend; original Windows failure NOT reproduced here."
-        : "See individual results; this is not yet a clean nested-versus-local reproduction."
-    : "Run both OIT variants to compare results.";
-}
-function errors(gl) {
-  const result = [];
-  for (let i = 0; i < 32; ++i) {
-    const error = gl.getError();
-    if (error === gl.NO_ERROR) return result;
-    result.push("0x" + error.toString(16));
-    if (error === gl.CONTEXT_LOST_WEBGL) return result;
-  }
-  throw new Error("More than 32 consecutive WebGL errors");
-}
-function pixel(gl, attachment, x, y) {
-  const data = new Float32Array(4);
-  gl.readBuffer(gl.COLOR_ATTACHMENT0 + attachment);
-  gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, data);
-  return Array.from(data);
-}
-function matches(actual, expected) {
-  return actual.every((value, i) =>
-    Number.isFinite(value) &&
-    Math.abs(value - expected[i]) <= 0.0001 * Math.max(1, Math.abs(expected[i])));
-}
-function run(variant) {
-  const oldCanvas = document.querySelector("#" + variant.id);
+let currentReport;
+function run(local) {
+  const variant = variants.find(value => value.id === document.querySelector("#variant").value);
+  document.querySelector("#variant").disabled = true;
+  document.querySelector("#local").disabled = true;
+  document.querySelector("#nested").disabled = true;
+  const output = document.querySelector("#output");
+  const report = currentReport = { variant: variant.id, description: variant.description,
+    case: local ? "local" : "nested", userAgent: navigator.userAgent,
+    vertexSource, fragmentSource: fragmentSource(local, variant) };
+  const publish = () => output.textContent = JSON.stringify(report, null, 2);
   const canvas = document.createElement("canvas");
-  canvas.id = variant.id;
-  canvas.width = canvas.height = size;
-  oldCanvas.replaceWith(canvas);
-  const result = report.results[variant.id] = {
-    status: "RUNNING", transparent: variant.transparent, local: variant.local,
-    fragmentSource: fragmentSource(variant.transparent, variant.local),
-  };
-  const webglCanvas = document.createElement("canvas");
-  webglCanvas.width = webglCanvas.height = size;
-  const gl = webglCanvas.getContext("webgl2", { antialias: false, stencil: true });
-  webglCanvas.addEventListener("webglcontextlost", event => {
+  canvas.width = canvas.height = 16;
+  canvas.addEventListener("webglcontextlost", event => {
     event.preventDefault();
-    result.contextLost = true;
-    result.status = "FAIL";
+    // Preserve completed pixel checks and draw errors if context loss arrives later.
+    report.contextLossEvent = event.statusMessage || "Context lost";
     publish();
   });
+  const gl = canvas.getContext("webgl2", { antialias: false, stencil: true });
   if (!gl) {
-    result.status = "UNSUPPORTED";
-    result.reason = "WebGL2 unavailable";
+    report.error = "WebGL2 unavailable; restart Chrome before retrying";
     publish();
     return;
   }
-  const shaders = [];
-  const textures = [];
-  let program, framebuffer, depth;
-  try {
-    const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
-    const debugShaders = gl.getExtension("WEBGL_debug_shaders");
-    result.environment = {
-      vendor: gl.getParameter(gl.VENDOR),
-      renderer: gl.getParameter(gl.RENDERER),
-      unmaskedVendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : null,
-      unmaskedRenderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : null,
-      version: gl.getParameter(gl.VERSION),
-      shadingLanguageVersion: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
-    };
-    if (!gl.getExtension("EXT_color_buffer_float") || !gl.getExtension("EXT_float_blend")) {
-      result.status = "UNSUPPORTED";
-      result.reason = "EXT_color_buffer_float and EXT_float_blend required";
-      return;
+  const errors = () => {
+    const values = [];
+    for (let i = 0; i < 32; ++i) {
+      const error = gl.getError();
+      if (error === gl.NO_ERROR) break;
+      values.push("0x" + error.toString(16));
+      if (error === gl.CONTEXT_LOST_WEBGL) break;
     }
-    result.compile = [];
-    for (const [type, source] of [
-      [gl.VERTEX_SHADER, vertexSource],
-      [gl.FRAGMENT_SHADER, result.fragmentSource],
-    ]) {
-      const shader = gl.createShader(type);
-      shaders.push(shader);
+    return values;
+  };
+  try {
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    report.renderer = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    const debug = gl.getExtension("WEBGL_debug_shaders");
+    if (!gl.getExtension("EXT_color_buffer_float") || !gl.getExtension("EXT_float_blend"))
+      throw new Error("Float render targets/blending unavailable");
+    const program = gl.createProgram();
+    report.compile = [];
+    const shaders = [vertexSource, report.fragmentSource].map((source, index) => {
+      const shader = gl.createShader(index ? gl.FRAGMENT_SHADER : gl.VERTEX_SHADER);
       gl.shaderSource(shader, source);
       gl.compileShader(shader);
-      const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
-      result.compile.push({ type, compiled, log: gl.getShaderInfoLog(shader) });
-      if (!compiled) throw new Error("Shader compilation failed");
-    }
-    program = gl.createProgram();
-    shaders.forEach(shader => gl.attachShader(program, shader));
+      const ok = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+      report.compile.push({ ok, log: gl.getShaderInfoLog(shader) });
+      if (!ok) throw new Error("Shader compilation failed");
+      gl.attachShader(program, shader);
+      return shader;
+    });
     gl.linkProgram(program);
-    result.linked = gl.getProgramParameter(program, gl.LINK_STATUS);
-    result.programLogBeforeDraw = gl.getProgramInfoLog(program);
-    if (!result.linked) throw new Error("Program linking failed");
-    framebuffer = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-    const attachments = [];
-    for (let i = 0; i < (variant.transparent ? 2 : 3); ++i) {
-      const texture = gl.createTexture();
-      textures.push(texture);
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, size, size);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, texture, 0);
-      attachments.push(gl.COLOR_ATTACHMENT0 + i);
+    report.linked = gl.getProgramParameter(program, gl.LINK_STATUS);
+    report.logBeforeDraw = gl.getProgramInfoLog(program);
+    if (!report.linked) throw new Error("Program linking failed");
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gl.createFramebuffer());
+    for (let i = 0; i < (variant.single ? 1 : 2); ++i) {
+      gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, 16, 16);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i,
+        gl.TEXTURE_2D, gl.getParameter(gl.TEXTURE_BINDING_2D), 0);
     }
-    gl.drawBuffers(attachments);
-    depth = gl.createRenderbuffer();
-    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, size, size);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, depth);
-    result.framebufferStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    if (result.framebufferStatus !== gl.FRAMEBUFFER_COMPLETE) throw new Error("Incomplete framebuffer");
+    gl.drawBuffers(variant.single ? [gl.COLOR_ATTACHMENT0] : [gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.bindTexture(gl.TEXTURE_2D, null);
-    gl.viewport(0, 0, size, size);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, gl.createRenderbuffer());
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, 16, 16);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT,
+      gl.RENDERBUFFER, gl.getParameter(gl.RENDERBUFFER_BINDING));
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE)
+      throw new Error("Incomplete framebuffer");
+    gl.viewport(0, 0, 16, 16);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST);
-    gl.depthMask(!variant.transparent);
-    if (variant.transparent) {
-      gl.enable(gl.BLEND);
-      gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
-    }
+    gl.depthMask(false);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(program);
-    const alpha = variant.transparent ? 0.8 : 1;
-    gl.uniform4f(gl.getUniformLocation(program, "uColor"), 0.25 * alpha, 0.5 * alpha, 0.75 * alpha, alpha);
-    gl.uniform1ui(gl.getUniformLocation(program, "uPickID"), 7);
-    result.errorsBeforeDraw = errors(gl);
+    gl.uniform4f(gl.getUniformLocation(program, "color"), 0.2, 0.4, 0.6, 0.8);
+    report.errorsBeforeDraw = errors();
     publish();
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
-    result.errorsAfterDraw = errors(gl);
-    result.contextLost = gl.isContextLost();
-    result.programLogAfterDraw = gl.getProgramInfoLog(program);
-    result.shaderLogsAfterDraw = shaders.map(shader => gl.getShaderInfoLog(shader));
-    result.translatedSources = debugShaders && !result.contextLost
-      ? shaders.map(shader => debugShaders.getTranslatedShaderSource(shader))
-      : null;
-    result.translationNote = "May omit final draw-time specialization; null means unavailable/lost.";
-    if (result.contextLost) throw new Error("Context lost during draw");
-    const weight = variant.transparent ? (alpha * 8 + 0.01) ** 3 * 0.525 ** 3 : 1;
-    result.center0 = pixel(gl, 0, 8, 8);
-    result.center1 = pixel(gl, 1, 8, 8);
-    result.clippedCorner = pixel(gl, 0, 4, 4);
-    result.expectedCenter0 = [0.25 * alpha * weight, 0.5 * alpha * weight, 0.75 * alpha * weight, variant.transparent ? 1 - alpha : alpha];
-    result.expectedCenter1 = variant.transparent ? [alpha * weight, 0, 0, 1] : [0.5, 0.5, 0.5, 1];
-    result.pixelsCorrect =
-      matches(result.center0, result.expectedCenter0) &&
-      matches(result.center1, result.expectedCenter1) &&
-      matches(result.clippedCorner, [0, 0, 0, 1]);
-    if (!variant.transparent) {
-      result.pickPixel = pixel(gl, 2, 8, 8);
-      result.pixelsCorrect &&= matches(result.pickPixel, [7, 7, 7, 1]);
-    }
-    result.readbackErrors = errors(gl);
-    result.status = result.errorsBeforeDraw.length === 0 &&
-      result.errorsAfterDraw.length === 0 && result.readbackErrors.length === 0 &&
-      result.pixelsCorrect ? "PASS" : "FAIL";
-    gl.readBuffer(gl.COLOR_ATTACHMENT0);
-    const pixels = new Float32Array(size * size * 4);
-    gl.readPixels(0, 0, size, size, gl.RGBA, gl.FLOAT, pixels);
-    const image = new ImageData(size, size);
-    for (let i = 0; i < pixels.length; i += 4) {
-      for (let channel = 0; channel < 3; ++channel) {
-        image.data[i + channel] = Math.round(255 * Math.max(0, Math.min(1, pixels[i + channel] / weight)));
-      }
-      image.data[i + 3] = 255;
-    }
-    canvas.getContext("2d").putImageData(image, 0, 0);
-    result.previewErrors = errors(gl);
-  } catch (error) {
-    result.status = "FAIL";
-    result.exception = String(error);
-    console.error(variant.id, error);
-  } finally {
+    report.errorsAfterDraw = errors();
+    report.contextLostAfterDraw = gl.isContextLost();
+    report.logAfterDraw = gl.getProgramInfoLog(program);
+    report.shaderLogsAfterDraw = shaders.map(shader => gl.getShaderInfoLog(shader));
+    report.translatedSources = debug && !gl.isContextLost()
+      ? shaders.map(shader => debug.getTranslatedShaderSource(shader)) : null;
+    const pixel = (attachment, x, y) => {
+      const data = new Float32Array(4);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0 + attachment);
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, data);
+      return Array.from(data);
+    };
     if (!gl.isContextLost()) {
-      shaders.forEach(shader => gl.deleteShader(shader));
-      textures.forEach(texture => gl.deleteTexture(texture));
-      if (program) gl.deleteProgram(program);
-      if (framebuffer) gl.deleteFramebuffer(framebuffer);
-      if (depth) gl.deleteRenderbuffer(depth);
+      report.center0 = pixel(0, 8, 8);
+      if (!variant.single) report.center1 = pixel(1, 8, 8);
+      report.clippedCorner = pixel(0, 4, 4);
+      const w = variant.constant ? 1 : 6.41 ** 3 * 0.525 ** 3;
+      const expectedColor = [0.2*w, 0.4*w, 0.6*w, 0.2];
+      const actual = [report.center0];
+      report.expected = [expectedColor];
+      if (!variant.single) {
+        actual.push(report.center1);
+        report.expected.push([0.8*w, 0, 0, 1]);
+      }
+      actual.push(report.clippedCorner);
+      report.expected.push(variant.noDiscard ? expectedColor : [0, 0, 0, 1]);
+      report.pixelsCorrect = actual
+        .every((values, i) => values.every((v, j) =>
+          Number.isFinite(v) && Math.abs(v - report.expected[i][j]) < 0.001));
+      report.readbackErrors = errors();
     }
-    publish();
+    report.drawPassed = !report.contextLostAfterDraw &&
+      report.errorsBeforeDraw.length === 0 && report.errorsAfterDraw.length === 0 &&
+      report.pixelsCorrect === true && report.readbackErrors.length === 0;
+  } catch (error) {
+    report.error = String(error);
+    console.error(error);
   }
+  publish();
 }
+document.querySelector("#local").onclick = () => run(true);
+document.querySelector("#nested").onclick = () => run(false);
+const selector = document.querySelector("#variant");
 for (const variant of variants) {
-  const container = document.createElement("div");
-  container.className = "case";
-  const canvas = document.createElement("canvas");
-  canvas.id = variant.id;
-  canvas.width = canvas.height = size;
-  const button = document.createElement("button");
-  button.textContent = "Run " + variant.id;
-  button.onclick = () => run(variant);
-  container.append(button, document.createElement("br"), canvas);
-  document.querySelector("#cases").append(container);
+  const option = document.createElement("option");
+  option.value = option.textContent = variant.id;
+  selector.append(option);
 }
-document.querySelector("#run").onclick = async () => {
-  for (const variant of variants) {
-    run(variant);
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-};
+function showSources() {
+  const variant = variants.find(value => value.id === selector.value);
+  document.querySelector("#description").textContent = variant.description;
+  document.querySelector("#sources").textContent =
+    "NESTED\n" + fragmentSource(false, variant) + "\n\nLOCAL\n" + fragmentSource(true, variant);
+}
+selector.onchange = showSources;
+showSources();
 document.querySelector("#download").onclick = () => {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], {type: "application/json"}));
+  if (!currentReport) {
+    document.querySelector("#output").textContent = "Run a case before downloading a report.";
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([JSON.stringify(currentReport, null, 2)], {type: "application/json"}));
   const link = document.createElement("a");
   link.href = url;
-  link.download = "angle-d3d11-discard-report.json";
+  link.download = `${currentReport.variant}-${currentReport.case}.json`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
-document.querySelector("#sources").textContent =
-  vertexSource + "\n" + variants.map(variant =>
-    variant.id + "\n" + fragmentSource(variant.transparent, variant.local)).join("\n");
 </script>
-</html>
